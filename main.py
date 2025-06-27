@@ -1,3 +1,4 @@
+# --- 📦 Импорт стандартных и сторонних библиотек ---
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import matplotlib.pyplot as plt
@@ -9,17 +10,26 @@ import simpleaudio as sa
 import soundfile as sf
 import os
 
+# --- 🔧 Импорт пользовательских фильтров ---
+from ui_noise import apply_noise_filter
+from ui_normalize import apply_normalization
+from ui_trim import apply_trim_silence
+from ui_phoneme_analysis import PhonemeAnalyzer  # <-- новый импорт
+
+# --- 🧠 Класс приложения с GUI ---
 class AudioApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Аудио Обработчик")
         self.root.geometry("1000x600")
+
+        # 🧾 Хранилище данных
         self.audio_data = None
         self.original_audio_data = None
         self.sr = None
         self.filepath = ""
 
-        # Левый блок — флажки
+        # --- 📌 Боковая панель слева (флажки) ---
         self.left_panel = tk.Frame(root, bg="black", width=200)
         self.left_panel.pack(side="left", fill="y")
 
@@ -34,7 +44,7 @@ class AudioApp:
         tk.Checkbutton(self.left_panel, text="Обрезка тишины", variable=self.flag3,
                        bg="black", fg="white", selectcolor="gray20", activebackground="black").pack(anchor="w")
 
-        # Кнопки управления (внизу слева)
+        # --- 🧰 Кнопки управления ---
         self.controls_frame = tk.Frame(self.left_panel, bg="black")
         self.controls_frame.pack(side="bottom", pady=10)
 
@@ -43,8 +53,9 @@ class AudioApp:
         tk.Button(self.controls_frame, text="💾 Сохранить", command=self.save_audio).pack(fill="x", pady=2)
         tk.Button(self.controls_frame, text="ОБРАБОТАТЬ", command=self.process_audio,
                   font=("Arial", 12), bg="white").pack(fill="x", pady=10)
+        tk.Button(self.controls_frame, text="📊 Анализ речи", command=self.analyze_audio).pack(fill="x", pady=5)  # <-- новая кнопка
 
-        # Центральная панель — график с прокруткой
+        # --- 📊 Центральная панель с графиком ---
         self.graph_frame = tk.Frame(root, bg="orange")
         self.graph_frame.pack(side="left", fill="both", expand=True)
 
@@ -74,11 +85,12 @@ class AudioApp:
             widget.destroy()
 
         fig, ax = plt.subplots(figsize=(10, 3), dpi=100)
-
         if self.original_audio_data is not None:
-            librosa.display.waveshow(self.original_audio_data, sr=self.sr, ax=ax, alpha=0.5, color='gray', label='Оригинал')
+            librosa.display.waveshow(self.original_audio_data, sr=self.sr, ax=ax,
+                                     alpha=0.5, color='gray', label='Оригинал')
         if self.audio_data is not None:
-            librosa.display.waveshow(self.audio_data, sr=self.sr, ax=ax, alpha=0.9, color='blue', label='Обработанный')
+            librosa.display.waveshow(self.audio_data, sr=self.sr, ax=ax,
+                                     alpha=0.9, color='blue', label='Обработанный')
 
         ax.set_title("Сравнение аудиосигналов")
         ax.legend(loc="upper right")
@@ -95,11 +107,11 @@ class AudioApp:
         y = self.original_audio_data.copy()
 
         if self.flag1.get():
-            y = librosa.effects.preemphasis(y)
+            y = apply_noise_filter(y)
         if self.flag2.get():
-            y = y / np.max(np.abs(y))
+            y = apply_normalization(y)
         if self.flag3.get():
-            y = librosa.effects.trim(y)[0]
+            y = apply_trim_silence(y, self.sr)
 
         self.audio_data = y
         self.draw_waveform()
@@ -117,7 +129,14 @@ class AudioApp:
                 sf.write(out_path, self.audio_data, self.sr)
                 messagebox.showinfo("Сохранено", f"Файл сохранён как {os.path.basename(out_path)}")
 
-# Запуск
+    def analyze_audio(self):
+        if self.audio_data is not None:
+            analyzer = PhonemeAnalyzer(self.root, self.audio_data, self.sr)
+            analyzer.analyze()
+        else:
+            messagebox.showwarning("Нет аудио", "Сначала загрузите и обработайте аудиофайл.")
+
+# --- 🚀 Точка входа ---
 if __name__ == "__main__":
     root = tk.Tk()
     app = AudioApp(root)

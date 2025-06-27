@@ -16,7 +16,13 @@ def install_packages():
         "numpy",
         "simpleaudio",
         "soundfile",  # для сохранения .wav
-        "tk"          # для GUI (обычно встроен в Python, но на Linux иногда надо явно)
+        "tk",          # для GUI (обычно встроен в Python, но на Linux иногда надо явно)
+        "transformers",
+        "torchaudio",
+        "pandas",
+        "soundfile",
+        "torch",
+        "ffmpeg"
     ]
 
     for package in required_packages:
