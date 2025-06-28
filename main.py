@@ -14,7 +14,9 @@ import os
 from ui_noise import apply_noise_filter
 from ui_normalize import apply_normalization
 from ui_trim import apply_trim_silence
-from ui_phoneme_analysis import PhonemeAnalyzer  # <-- новый импорт
+from ui_phoneme_analysis import PhonemeAnalyzer
+from ui_slice_filter import apply_marker_zeroing_filter
+from ui_latent_segments import smooth_signal, find_nonzero_segments
 
 # --- 🧠 Класс приложения с GUI ---
 class AudioApp:
@@ -23,26 +25,31 @@ class AudioApp:
         self.root.title("Аудио Обработчик")
         self.root.geometry("1000x600")
 
-        # 🧾 Хранилище данных
         self.audio_data = None
         self.original_audio_data = None
         self.sr = None
         self.filepath = ""
 
-        # --- 📌 Боковая панель слева (флажки) ---
+        # --- 📌 Боковая панель слева ---
         self.left_panel = tk.Frame(root, bg="black", width=200)
         self.left_panel.pack(side="left", fill="y")
 
         self.flag1 = tk.BooleanVar()
         self.flag2 = tk.BooleanVar()
         self.flag3 = tk.BooleanVar()
+        self.flag4 = tk.BooleanVar()
+        self.flag5 = tk.BooleanVar()
 
         tk.Checkbutton(self.left_panel, text="Фильтр шума", variable=self.flag1,
-                       bg="black", fg="white", selectcolor="gray20", activebackground="black").pack(anchor="w")
+                       bg="black", fg="white", selectcolor="gray20").pack(anchor="w")
         tk.Checkbutton(self.left_panel, text="Нормализация", variable=self.flag2,
-                       bg="black", fg="white", selectcolor="gray20", activebackground="black").pack(anchor="w")
+                       bg="black", fg="white", selectcolor="gray20").pack(anchor="w")
         tk.Checkbutton(self.left_panel, text="Обрезка тишины", variable=self.flag3,
-                       bg="black", fg="white", selectcolor="gray20", activebackground="black").pack(anchor="w")
+                       bg="black", fg="white", selectcolor="gray20").pack(anchor="w")
+        tk.Checkbutton(self.left_panel, text="Фонемы → зануление вне", variable=self.flag4,
+                       bg="black", fg="white", selectcolor="gray20").pack(anchor="w")
+        tk.Checkbutton(self.left_panel, text="📈 Энергетические интервалы", variable=self.flag5,
+                       bg="black", fg="white", selectcolor="gray20").pack(anchor="w")
 
         # --- 🧰 Кнопки управления ---
         self.controls_frame = tk.Frame(self.left_panel, bg="black")
@@ -53,18 +60,16 @@ class AudioApp:
         tk.Button(self.controls_frame, text="💾 Сохранить", command=self.save_audio).pack(fill="x", pady=2)
         tk.Button(self.controls_frame, text="ОБРАБОТАТЬ", command=self.process_audio,
                   font=("Arial", 12), bg="white").pack(fill="x", pady=10)
-        tk.Button(self.controls_frame, text="📊 Анализ речи", command=self.analyze_audio).pack(fill="x", pady=5)  # <-- новая кнопка
+        tk.Button(self.controls_frame, text="📊 Анализ речи", command=self.analyze_audio).pack(fill="x", pady=5)
 
-        # --- 📊 Центральная панель с графиком ---
+        # --- 📊 График ---
         self.graph_frame = tk.Frame(root, bg="orange")
         self.graph_frame.pack(side="left", fill="both", expand=True)
 
         self.canvas_container = tk.Canvas(self.graph_frame, bg="white")
         self.scroll_x = tk.Scrollbar(self.graph_frame, orient="horizontal", command=self.canvas_container.xview)
         self.scroll_y = tk.Scrollbar(self.graph_frame, orient="vertical", command=self.canvas_container.yview)
-
         self.canvas_container.configure(xscrollcommand=self.scroll_x.set, yscrollcommand=self.scroll_y.set)
-
         self.scroll_x.pack(side="bottom", fill="x")
         self.scroll_y.pack(side="right", fill="y")
         self.canvas_container.pack(side="left", fill="both", expand=True)
@@ -112,6 +117,15 @@ class AudioApp:
             y = apply_normalization(y)
         if self.flag3.get():
             y = apply_trim_silence(y, self.sr)
+        if self.flag4.get():
+            markers = [1.5, 3.0, 6.2, 7.5]  # временные маркеры
+            y = apply_marker_zeroing_filter(y, self.sr, markers, buffer=0.5)
+        if self.flag5.get():
+            smoothed = smooth_signal(y)
+            energy = np.sqrt(smoothed ** 2)
+            segments = find_nonzero_segments(energy, self.sr)
+            text = "\n".join([f"{start:.2f} – {end:.2f} сек" for start, end in segments])
+            messagebox.showinfo("📈 Интервалы энергии", f"Найдено: {len(segments)}\n\n{text}")
 
         self.audio_data = y
         self.draw_waveform()
