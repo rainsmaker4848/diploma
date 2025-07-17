@@ -11,6 +11,7 @@ def upgrade_pip():
 
 def install_packages():
     required_packages = [
+        "openpyxl",
         "matplotlib",
         "librosa",
         "numpy",
