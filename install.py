@@ -23,7 +23,8 @@ def install_packages():
         "pandas",
         "soundfile",
         "torch",
-        "ffmpeg"
+        "ffmpeg",
+        "noisereduce"
     ]
 
     for package in required_packages:
