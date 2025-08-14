@@ -1,106 +1,46 @@
-# --- 📦 Импорт стандартных и сторонних библиотек ---
+# --- 📦 Импорт стандартных библиотек ---
 import tkinter as tk
-from tkinter import filedialog, messagebox
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import numpy as np
-import librosa
-import librosa.display
-import simpleaudio as sa
-import soundfile as sf
-import os
 import pandas as pd
+import os
+from tkinter import messagebox, filedialog
 
-# --- 🔧 Импорт пользовательских фильтров ---
-from ui_noise import apply_noise_filter
-from ui_normalize import apply_normalization
-from ui_trim import apply_trim_silence
+# --- 🔧 Импорт внутренних модулей ---
+from ui_buttons import setup_interface
+from ui_player import load_audio, save_audio, play_audio
+from ui_markers import load_markers_from_file
+from ui_plot import draw_waveform, plot_series_segments
+from ui_speed import change_audio_speed
 from ui_phoneme_analysis import PhonemeAnalyzer
 from ui_slice_filter import apply_marker_zeroing_filter
-from ui_latent_free import smooth_signal, compute_threshold
-import ui_latent_free
+from ui_latent_free import smooth_signal, compute_threshold, find_nonzero_segments
 import ui_latent_experiment
+from ui_preprocessing import apply_preprocessing_pipeline
 
 
-# --- 🧠 Класс приложения с GUI ---
 class AudioApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Аудио Обработчик")
         self.root.geometry("1300x1000")
 
+        # --- Состояния и данные ---
         self.audio_data = None
         self.original_audio_data = None
         self.sr = None
         self.filepath = ""
+        self.marker_path = ""
+        self.markers = []
+        self.display_markers = []
         self.current_segments = None
         self.phoneme_table = None
 
-        # --- 📌 Боковая панель слева ---
+        # --- UI Элементы ---
         self.left_panel = tk.Frame(root, bg="black", width=200)
         self.left_panel.pack(side="left", fill="y")
 
-        self.flag1 = tk.BooleanVar()
-        self.flag2 = tk.BooleanVar()
-        self.flag3 = tk.BooleanVar()
-        self.flag4 = tk.BooleanVar()
-        self.flag5 = tk.BooleanVar()
-
-        tk.Checkbutton(self.left_panel, text="Фильтр шума", variable=self.flag1,
-                       bg="black", fg="white", selectcolor="gray20").pack(anchor="w")
-        tk.Checkbutton(self.left_panel, text="Нормализация", variable=self.flag2,
-                       bg="black", fg="white", selectcolor="gray20").pack(anchor="w")
-        tk.Checkbutton(self.left_panel, text="Обрезка тишины", variable=self.flag3,
-                       bg="black", fg="white", selectcolor="gray20").pack(anchor="w")
-        tk.Checkbutton(self.left_panel, text="Фонемы → зануление вне", variable=self.flag4,
-                       bg="black", fg="white", selectcolor="gray20").pack(anchor="w")
-        tk.Checkbutton(self.left_panel, text=" Энергетические интервалы", variable=self.flag5,
-                       bg="black", fg="white", selectcolor="gray20").pack(anchor="w")
-
-        # --- 🔧 Параметры анализа ---
-        tk.Label(self.left_panel, text="⚙ Параметры анализа", bg="black", fg="white").pack(anchor="w", pady=(10, 0))
-
-        self.speed_factor = tk.DoubleVar(value=1.0)
-        tk.Label(self.left_panel, text="Скорость", bg="black", fg="white").pack(anchor="w")
-        tk.Scale(self.left_panel, from_=0.5, to=2.0, resolution=0.1, orient="horizontal",
-                 variable=self.speed_factor, bg="black", fg="white").pack(fill="x")
-
-        self.quantile = tk.DoubleVar(value=0.92)
-        tk.Label(self.left_panel, text="Квантиль", bg="black", fg="white").pack(anchor="w")
-        tk.Scale(self.left_panel, from_=0.5, to=0.99, resolution=0.01, orient="horizontal",
-                 variable=self.quantile, bg="black", fg="white").pack(fill="x")
-
-        self.merge_threshold = tk.DoubleVar(value=1.0)
-        tk.Label(self.left_panel, text="Слияние (сек)", bg="black", fg="white").pack(anchor="w")
-        tk.Scale(self.left_panel, from_=0.1, to=3.0, resolution=0.1, orient="horizontal",
-                 variable=self.merge_threshold, bg="black", fg="white").pack(fill="x")
-
-        self.smooth_window = tk.IntVar(value=5)
-        tk.Label(self.left_panel, text="Сглаживание", bg="black", fg="white").pack(anchor="w")
-        tk.Scale(self.left_panel, from_=1, to=21, resolution=2, orient="horizontal",
-                 variable=self.smooth_window, bg="black", fg="white").pack(fill="x")
-
-        # --- Выбор режима эксперимента ---
-        tk.Label(self.left_panel, text="Тип эксперимента", bg="black", fg="white").pack(anchor="w", pady=(10, 0))
-        self.experiment_type = tk.StringVar(value="свободный")
-        tk.OptionMenu(self.left_panel, self.experiment_type, "свободный", "5:6").pack(fill="x")
-
-        # --- 🧰 Кнопки управления ---
-        self.controls_frame = tk.Frame(self.left_panel, bg="black")
-        self.controls_frame.pack(side="bottom", pady=10)
-
-        tk.Button(self.controls_frame, text="Загрузить аудиофайл", command=self.load_audio).pack(fill="x", pady=2)
-        tk.Button(self.controls_frame, text="▶ Прослушать", command=self.play_audio).pack(fill="x", pady=2)
-        tk.Button(self.controls_frame, text="💾 Сохранить", command=self.save_audio).pack(fill="x", pady=2)
-        tk.Button(self.controls_frame, text="ОБРАБОТАТЬ", command=self.process_audio,
-                  font=("Arial", 12), bg="white").pack(fill="x", pady=10)
-        tk.Button(self.controls_frame, text="📊 Анализ речи", command=self.analyze_audio).pack(fill="x", pady=5)
-        tk.Button(self.controls_frame, text="📤 Выгрузить отчёт", command=self.export_report).pack(fill="x", pady=5)
-
-        # --- 📊 График ---
         self.graph_frame = tk.Frame(root, bg="orange")
         self.graph_frame.pack(side="left", fill="both", expand=True)
-
         self.canvas_container = tk.Canvas(self.graph_frame, bg="white")
         self.scroll_x = tk.Scrollbar(self.graph_frame, orient="horizontal", command=self.canvas_container.xview)
         self.scroll_y = tk.Scrollbar(self.graph_frame, orient="vertical", command=self.canvas_container.yview)
@@ -108,120 +48,44 @@ class AudioApp:
         self.scroll_x.pack(side="bottom", fill="x")
         self.scroll_y.pack(side="right", fill="y")
         self.canvas_container.pack(side="left", fill="both", expand=True)
-
         self.canvas_frame = tk.Frame(self.canvas_container)
         self.canvas_container.create_window((0, 0), window=self.canvas_frame, anchor="nw")
         self.canvas_frame.bind("<Configure>", lambda e: self.canvas_container.configure(scrollregion=self.canvas_container.bbox("all")))
 
+        # --- Переменные интерфейса ---
+        self.flag1 = tk.BooleanVar()
+        self.flag2 = tk.BooleanVar()
+        self.flag3 = tk.BooleanVar()
+        self.flag4 = tk.BooleanVar()
+        self.flag5 = tk.BooleanVar()
+
+        self.speed_factor = tk.DoubleVar(value=1.0)
+        self.quantile = tk.DoubleVar(value=0.97)
+        self.merge_threshold = tk.DoubleVar(value=1.0)
+        self.smooth_window = tk.IntVar(value=5)
+        self.experiment_type = tk.StringVar(value="свободный")
+        self.experiment_part = tk.StringVar(value="1 ч.")
+
+        # --- Настройка интерфейса ---
+        setup_interface(self)
+
     def load_audio(self):
-        self.filepath = filedialog.askopenfilename(filetypes=[("Audio Files", "*.wav *.mp3")])
-        if self.filepath:
-            self.original_audio_data, self.sr = librosa.load(self.filepath, sr=None)
-            self.audio_data = self.original_audio_data.copy()
-            self.current_segments = None
-            self.draw_waveform()
-
-    def draw_waveform(self, segments=None, threshold=None, series_lines=None):
-        for widget in self.canvas_frame.winfo_children():
-            widget.destroy()
-
-        fig, ax = plt.subplots(figsize=(10, 3), dpi=100)
-
-        if self.original_audio_data is not None:
-            librosa.display.waveshow(self.original_audio_data, sr=self.sr, ax=ax,
-                                     alpha=0.5, color='gray', label='Оригинал')
-        if self.audio_data is not None:
-            librosa.display.waveshow(self.audio_data, sr=self.sr, ax=ax,
-                                     alpha=0.9, color='blue', label='Обработанный')
-
-        segments_to_draw = segments if segments is not None else self.current_segments
-        if segments_to_draw:
-            for start, end in segments_to_draw:
-                ax.axvline(x=start, color='green', linestyle='--')
-                ax.axvline(x=end, color='red', linestyle='--')
-                ax.axvspan(start, end, color='green', alpha=0.2)
-
-        if threshold:
-            ax.axhline(y=threshold, color='purple', linestyle='--', label='Порог')
-
-        if series_lines:
-            for x in series_lines:
-                ax.axvline(x=x, color='purple', linestyle='-.', linewidth=2)
-
-        ax.set_title("Сравнение аудиосигналов")
-        ax.legend(loc="upper right")
-
-        canvas = FigureCanvasTkAgg(fig, master=self.canvas_frame)
-        canvas.draw()
-        canvas.get_tk_widget().pack()
-
-    def process_audio(self):
-        if self.original_audio_data is None:
-            messagebox.showwarning("Нет файла", "Сначала загрузите файл.")
-            return
-
-        y = self.original_audio_data.copy()
-        self.current_segments = None
-        threshold = None
-        series_lines = []
-
-        if self.flag1.get():
-            y = apply_noise_filter(y)
-        if self.flag2.get():
-            y = apply_normalization(y)
-        if self.flag3.get():
-            y = apply_trim_silence(y, self.sr)
-        if self.flag4.get():
-            markers = [1.5, 3.0, 6.2, 7.5]
-            y = apply_marker_zeroing_filter(y, self.sr, markers, buffer=0.5)
-        if self.flag5.get():
-            speed = self.speed_factor.get()
-            quantile = self.quantile.get()
-            merge = self.merge_threshold.get()
-            window = self.smooth_window.get()
-
-            y = librosa.resample(y, orig_sr=self.sr, target_sr=int(self.sr * speed))
-            self.sr = int(self.sr * speed)
-
-            energy = np.abs(y)
-            smoothed = smooth_signal(energy, window)
-            threshold = compute_threshold(smoothed, quantile)
-
-            if self.experiment_type.get() == "свободный":
-                segments = ui_latent_free.find_nonzero_segments(smoothed, self.sr, threshold, merge)
-            else:
-                try:
-                    segments = ui_latent_experiment.find_nonzero_segments(smoothed, self.sr, threshold, merge)
-                except ValueError as e:
-                    messagebox.showerror("Ошибка", str(e))
-                    return
-
-                series_lines = [segments[i * 6][0] for i in range(1, 5)]
-
-            self.current_segments = segments
-            self.audio_data = y
-            self.draw_waveform(segments=segments, threshold=threshold, series_lines=series_lines)
-
-            text = "\n".join([f"{start:.2f} – {end:.2f} сек" for start, end in segments])
-            messagebox.showinfo(" Энергетические интервалы", f"Найдено: {len(segments)}\n\n{text}")
-            messagebox.showinfo("Готово", "Обработка завершена!")
-            return
-
-        self.audio_data = y
-        self.draw_waveform()
-        messagebox.showinfo("Готово", "Обработка завершена!")
-
-    def play_audio(self):
-        if self.audio_data is not None:
-            audio = (self.audio_data * 32767).astype(np.int16)
-            sa.play_buffer(audio, 1, 2, self.sr)
+        load_audio(self)
 
     def save_audio(self):
-        if self.audio_data is not None:
-            out_path = filedialog.asksaveasfilename(defaultextension=".wav", filetypes=[("WAV", "*.wav")])
-            if out_path:
-                sf.write(out_path, self.audio_data, self.sr)
-                messagebox.showinfo("Сохранено", f"Файл сохранён как {os.path.basename(out_path)}")
+        save_audio(self)
+
+    def play_audio(self):
+        play_audio(self)
+
+    def load_markers(self):
+        result = load_markers_from_file(self)
+        if result:
+            path, markers, labels = result
+            self.marker_path = path
+            self.markers = markers
+            self.display_markers = labels
+            messagebox.showinfo("Метки загружены", f"Всего: {len(markers)} меток")
 
     def analyze_audio(self):
         if self.audio_data is not None:
@@ -231,58 +95,95 @@ class AudioApp:
         else:
             messagebox.showwarning("Нет аудио", "Сначала загрузите и обработайте аудиофайл.")
 
+    def process_audio(self):
+        if self.original_audio_data is None:
+            messagebox.showwarning("Нет файла", "Сначала загрузите аудиофайл.")
+            return
+
+        y, sr = change_audio_speed(self.original_audio_data.copy(), self.sr, self.speed_factor.get())
+        self.sr = sr
+
+        y = apply_preprocessing_pipeline(y, sr, self.flag1.get(), self.flag2.get(), self.flag3.get())
+
+        if self.flag4.get():
+            if not self.markers:
+                messagebox.showwarning("Нет меток", "Сначала загрузите файл с метками.")
+                return
+            y = apply_marker_zeroing_filter(y, sr, self.markers)
+
+        segments, threshold, series_lines = None, None, []
+
+        if self.flag5.get():
+            energy = np.abs(y)
+            if energy.ndim == 2:
+                if self.experiment_type.get() == "свободный":
+                    energy = energy[0]  # используем первый канал
+                smoothed = smooth_signal(energy, self.smooth_window.get())
+            else:
+                smoothed = smooth_signal(energy, self.smooth_window.get())
+
+            if self.experiment_type.get() == "свободный":
+                threshold = compute_threshold(smoothed, self.quantile.get())
+                segments = find_nonzero_segments(smoothed, sr, threshold, self.merge_threshold.get())
+            elif self.experiment_type.get() == "5:6" and self.markers:
+                if y.ndim == 1:
+                    messagebox.showerror("Ошибка", "Для режима 2ch требуется стерео (2 канала)")
+                    return
+                mode = "2ch" if self.experiment_part.get() == "2 ч." else "1ch"
+                q_segments, a_segments = ui_latent_experiment.find_nonzero_segments_stereo(
+                    y, sr, self.markers,
+                    quantile=self.quantile.get(),
+                    smooth_window=self.smooth_window.get()
+                )
+                segments = q_segments + a_segments
+                series_lines = [m[0] for m in self.markers]
+
+        self.audio_data = y
+        self.current_segments = segments
+        draw_waveform(self, segments=segments, threshold=threshold, series_lines=series_lines)
+        messagebox.showinfo("Готово", "Обработка завершена!")
+
     def export_report(self):
         if not self.current_segments:
-            messagebox.showerror("Ошибка", "Сначала выполните обработку аудио с поиском латентных интервалов.")
+            messagebox.showerror("Ошибка", "Сначала выполните обработку аудио.")
             return
 
         save_path = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")])
         if not save_path:
             return
 
-        # --- 📑 1. Латентные интервалы ---
         df_segments = pd.DataFrame([{
             "Начало (сек)": start,
             "Конец (сек)": end,
             "Длительность (сек)": end - start
         } for start, end in self.current_segments])
 
-        # --- 📊 2. Статистика латентных интервалов ---
         stats = df_segments["Длительность (сек)"].describe().rename("Статистика")
         df_stats = pd.DataFrame(stats)
 
-        # --- ⚙ 3. Общие метрики сигнала ---
-        signal_metrics = {
-            "Имя файла": [os.path.basename(self.filepath)],
-            "Частота дискретизации": [self.sr],
-            "Длительность (сек)": [len(self.audio_data) / self.sr],
-            "Средняя мощность": [np.mean(self.audio_data**2)],
-            "Скорость": [self.speed_factor.get()],
-            "Квантиль": [self.quantile.get()],
-            "Порог слияния": [self.merge_threshold.get()],
-            "Сглаживание": [self.smooth_window.get()],
-            "Тип эксперимента": [self.experiment_type.get()]
-        }
-        df_metrics = pd.DataFrame(signal_metrics)
+        df_metrics = pd.DataFrame([{
+            "Файл": os.path.basename(self.filepath),
+            "Частота": self.sr,
+            "Длительность": len(self.audio_data[0] if self.audio_data.ndim == 2 else self.audio_data) / self.sr,
+            "Скорость": self.speed_factor.get(),
+            "Квантиль": self.quantile.get(),
+            "Сглаживание": self.smooth_window.get(),
+            "Тип": self.experiment_type.get(),
+            "Часть": self.experiment_part.get()
+        }])
 
-        # --- 🧠 4. Фонемный анализ ---
-        if self.phoneme_table is not None and not self.phoneme_table.empty:
-            df_phonemes = self.phoneme_table.copy()
-        else:
-            df_phonemes = pd.DataFrame([{"Сообщение": "Фонемный анализ не проводился или не дал результатов."}])
+        df_phonemes = self.phoneme_table.copy() if self.phoneme_table is not None else pd.DataFrame([{"Фонемы": "не проводился"}])
 
-        # --- 💾 Сохраняем всё в Excel ---
-        try:
-            with pd.ExcelWriter(save_path) as writer:
-                df_metrics.to_excel(writer, sheet_name="Общие метрики", index=False)
-                df_segments.to_excel(writer, sheet_name="Латентные интервалы", index=False)
-                df_stats.to_excel(writer, sheet_name="Статистика по длительности")
-                df_phonemes.to_excel(writer, sheet_name="Фонемы", index=False)
+        with pd.ExcelWriter(save_path) as writer:
+            df_metrics.to_excel(writer, sheet_name="Метрики", index=False)
+            df_segments.to_excel(writer, sheet_name="Интервалы", index=False)
+            df_stats.to_excel(writer, sheet_name="Статистика")
+            df_phonemes.to_excel(writer, sheet_name="Фонемы", index=False)
 
-            messagebox.showinfo("Отчёт сохранён", f"Файл сохранён как: {os.path.basename(save_path)}")
-        except Exception as e:
-            messagebox.showerror("Ошибка при сохранении", str(e))
+        messagebox.showinfo("Отчёт", f"Сохранён: {os.path.basename(save_path)}")
 
+    def plot_series_segments(self):
+        plot_series_segments(self)
 
 
 # --- 🚀 Точка входа ---

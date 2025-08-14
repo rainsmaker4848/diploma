@@ -1,0 +1,15 @@
+__pycache__/ui_buttons.cpython-38.pyc
+__pycache__/ui_latent_experiment.cpython-38.pyc
+__pycache__/ui_latent_free.cpython-38.pyc
+__pycache__/ui_latent_segments.cpython-38.pyc
+__pycache__/ui_markers.cpython-38.pyc
+__pycache__/ui_noise.cpython-38.pyc
+__pycache__/ui_normalize.cpython-38.pyc
+__pycache__/ui_phoneme_analysis.cpython-38.pyc
+__pycache__/ui_player.cpython-38.pyc
+__pycache__/ui_plot.cpython-38.pyc
+__pycache__/ui_preprocessing.cpython-38.pyc
+__pycache__/ui_slice_filter.cpython-38.pyc
+__pycache__/ui_speed.cpython-38.pyc
+__pycache__/ui_trim.cpython-38.pyc
+temp.wav
