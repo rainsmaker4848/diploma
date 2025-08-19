@@ -3,17 +3,22 @@ import tkinter as tk
 import numpy as np
 import pandas as pd
 import os
+import re
 from tkinter import messagebox, filedialog
 
 # --- 🔧 Импорт внутренних модулей ---
 from ui_buttons import setup_interface
 from ui_player import load_audio, save_audio, play_audio
 from ui_markers import load_markers_from_file
-from ui_plot import draw_waveform, plot_series_segments
+from ui_plot import draw_waveform, plot_series_segments, show_latent_tables
 from ui_speed import change_audio_speed
 from ui_phoneme_analysis import PhonemeAnalyzer
 from ui_slice_filter import apply_marker_zeroing_filter
+
+# ВНИМАНИЕ: ui_latent_free работает с МОНО (1D)!
 from ui_latent_free import smooth_signal, compute_threshold, find_nonzero_segments
+
+# 2ch режим 5:6
 import ui_latent_experiment
 from ui_preprocessing import apply_preprocessing_pipeline
 
@@ -30,17 +35,26 @@ class AudioApp:
         self.sr = None
         self.filepath = ""
         self.marker_path = ""
-        self.markers = []
-        self.display_markers = []
+        self.markers = []            # [(start, end), ...]
+        self.display_markers = []    # [(x, label), ...] только чётные
         self.current_segments = None
-        self.phoneme_table = None
+        self.current_q_segments = None  # вопросы (канал 1) для 5:6
+        self.current_a_segments = None  # ответы  (канал 2) для 5:6
+        self.phoneme_table = None         # общий (если считали по сведённому сигналу)
+        # по-канальным фонемным таблицам/стенограммам
+        self.phoneme_table_left = None
+        self.phoneme_table_right = None
+        self.transcript_text = None       # общий (если моно)
+        self.transcript_left = None
+        self.transcript_right = None
 
         # --- UI Элементы ---
-        self.left_panel = tk.Frame(root, bg="black", width=200)
+        self.left_panel = tk.Frame(root, bg="black", width=220)
         self.left_panel.pack(side="left", fill="y")
 
         self.graph_frame = tk.Frame(root, bg="orange")
         self.graph_frame.pack(side="left", fill="both", expand=True)
+
         self.canvas_container = tk.Canvas(self.graph_frame, bg="white")
         self.scroll_x = tk.Scrollbar(self.graph_frame, orient="horizontal", command=self.canvas_container.xview)
         self.scroll_y = tk.Scrollbar(self.graph_frame, orient="vertical", command=self.canvas_container.yview)
@@ -48,27 +62,42 @@ class AudioApp:
         self.scroll_x.pack(side="bottom", fill="x")
         self.scroll_y.pack(side="right", fill="y")
         self.canvas_container.pack(side="left", fill="both", expand=True)
+
         self.canvas_frame = tk.Frame(self.canvas_container)
         self.canvas_container.create_window((0, 0), window=self.canvas_frame, anchor="nw")
-        self.canvas_frame.bind("<Configure>", lambda e: self.canvas_container.configure(scrollregion=self.canvas_container.bbox("all")))
+        self.canvas_frame.bind(
+            "<Configure>",
+            lambda e: self.canvas_container.configure(scrollregion=self.canvas_container.bbox("all"))
+        )
 
         # --- Переменные интерфейса ---
-        self.flag1 = tk.BooleanVar()
-        self.flag2 = tk.BooleanVar()
-        self.flag3 = tk.BooleanVar()
-        self.flag4 = tk.BooleanVar()
-        self.flag5 = tk.BooleanVar()
+        self.flag1 = tk.BooleanVar()  # шум
+        self.flag2 = tk.BooleanVar()  # нормализация
+        self.flag3 = tk.BooleanVar()  # обрезка
+        self.flag4 = tk.BooleanVar()  # зануление вне меток
+        self.flag5 = tk.BooleanVar()  # энергетические интервалы
 
         self.speed_factor = tk.DoubleVar(value=1.0)
-        self.quantile = tk.DoubleVar(value=0.97)
+        self.quantile = tk.DoubleVar(value=0.99)  # начинаем сверху
         self.merge_threshold = tk.DoubleVar(value=1.0)
         self.smooth_window = tk.IntVar(value=5)
         self.experiment_type = tk.StringVar(value="свободный")
         self.experiment_part = tk.StringVar(value="1 ч.")
+        self.downsample_factor = tk.IntVar(value=1)  # управляется в ui_buttons/ui_player
 
         # --- Настройка интерфейса ---
         setup_interface(self)
 
+        # Кнопка стенограммы (добавляем к уже созданным в setup_interface)
+        try:
+            self.btn_transcript = tk.Button(self.controls_frame, text="📝 Стенограмма", command=self.make_transcript)
+            self.btn_transcript.pack(fill="x", pady=5)
+        except Exception:
+            # На всякий случай, если controls_frame не создан — добавим на левую панель
+            self.btn_transcript = tk.Button(self.left_panel, text="📝 Стенограмма", command=self.make_transcript)
+            self.btn_transcript.pack(fill="x", pady=5, side="bottom")
+
+    # --- Делегаты ---
     def load_audio(self):
         load_audio(self)
 
@@ -78,6 +107,7 @@ class AudioApp:
     def play_audio(self):
         play_audio(self)
 
+    # --- Маркеры ---
     def load_markers(self):
         result = load_markers_from_file(self)
         if result:
@@ -86,63 +116,270 @@ class AudioApp:
             self.markers = markers
             self.display_markers = labels
             messagebox.showinfo("Метки загружены", f"Всего: {len(markers)} меток")
+            if self.audio_data is not None:
+                draw_waveform(self)
 
+    # --- Анализ фонем (простой, единый) ---
     def analyze_audio(self):
-        if self.audio_data is not None:
-            analyzer = PhonemeAnalyzer(self.root, self.audio_data, self.sr)
-            analyzer.analyze()
-            self.phoneme_table = analyzer.get_phoneme_dataframe()
-        else:
+        if self.audio_data is None:
             messagebox.showwarning("Нет аудио", "Сначала загрузите и обработайте аудиофайл.")
+            return
+        analyzer = PhonemeAnalyzer(self.root, self.audio_data, self.sr)
+        analyzer.analyze()
+        self.phoneme_table = analyzer.get_phoneme_dataframe()
 
+    # --- Вспомогательное: превращаем (C,N) в отдельные 1D каналы ---
+    def _split_channels(self, y):
+        if y is None:
+            return None, None
+        if isinstance(y, np.ndarray) and y.ndim == 2:
+            # (C, N)
+            if y.shape[0] == 2:
+                return y[0], y[1]
+            # (N, C)
+            if y.shape[1] == 2:
+                return y[:, 0], y[:, 1]
+            # иначе сведём в моно
+            mono = np.mean(y, axis=0)
+            return mono, None
+        if isinstance(y, np.ndarray) and y.ndim == 1:
+            return y, None
+        return None, None
+
+    # --- Построение стенограммы на основе таблицы фонем (чистый текст) ---
+    def _infer_transcript_from_df(self, df: pd.DataFrame) -> str:
+        if df is None or df.empty:
+            return ""
+
+        # Найдём колонку с символами
+        candidate_cols = ["char", "symbol", "phoneme", "text", "label"]
+        col = None
+        for c in candidate_cols:
+            if c in df.columns:
+                col = c
+                break
+        if col is None:
+            # если нет явной колонки, попробуем первую строковую
+            for c in df.columns:
+                if df[c].dtype == object:
+                    col = c
+                    break
+        if col is None:
+            return ""
+
+        tokens = df[col].astype(str).tolist()
+
+        # Простейшая нормализация пробелов/служебных токенов
+        space_like = {"<sp>", "<space>", "sp", "space", "_", "[sp]", "<blank>"}
+        text = []
+        for t in tokens:
+            tt = t.strip()
+            if tt == "" or tt.lower() in space_like:
+                text.append(" ")
+            else:
+                text.append(tt)
+
+        # Склейка и лёгкая чистка
+        s = "".join(text)
+        s = re.sub(r"\s+", " ", s)          # схлопнуть множественные пробелы
+        s = re.sub(r"\s+([.,!?;:])", r"\1", s)  # убрать пробелы перед пунктуацией
+        s = s.strip()
+
+        # Капитализация первой буквы, если есть
+        if len(s) > 0:
+            s = s[0].upper() + s[1:]
+
+        return s
+
+    def make_transcript(self):
+        """
+        Построить стенограмму:
+        - если стерео: делаем отдельно для Л и П каналов -> две строки + показ в одном окне
+        - если моно: как раньше (self.transcript_text)
+        """
+        if self.audio_data is None:
+            messagebox.showwarning("Нет аудио", "Сначала загрузите и обработайте аудиофайл.")
+            return
+
+        chL, chR = self._split_channels(self.audio_data)
+
+        # левый канал
+        self.transcript_left = None
+        self.phoneme_table_left = None
+        if chL is not None:
+            try:
+                analyzerL = PhonemeAnalyzer(self.root, chL, self.sr)
+                analyzerL.analyze()
+                self.phoneme_table_left = analyzerL.get_phoneme_dataframe()
+                self.transcript_left = self._infer_transcript_from_df(self.phoneme_table_left)
+            except Exception as e:
+                print(f"[Transcript L] Ошибка: {e}")
+
+        # правый канал
+        self.transcript_right = None
+        self.phoneme_table_right = None
+        if chR is not None:
+            try:
+                analyzerR = PhonemeAnalyzer(self.root, chR, self.sr)
+                analyzerR.analyze()
+                self.phoneme_table_right = analyzerR.get_phoneme_dataframe()
+                self.transcript_right = self._infer_transcript_from_df(self.phoneme_table_right)
+            except Exception as e:
+                print(f"[Transcript R] Ошибка: {e}")
+
+        # если моно — сохраним совместимость со старым полем
+        if chR is None and self.transcript_left is not None:
+            self.transcript_text = self.transcript_left
+
+        # Показ в отдельном окне (только текст, без процентов/длин)
+        win = tk.Toplevel(self.root)
+        win.title("Стенограмма (по каналам)")
+        txt = tk.Text(win, wrap="word", height=25)
+        txt.pack(fill="both", expand=True)
+
+        if chR is None:
+            txt.insert("1.0", self.transcript_text if self.transcript_text else "(пусто)")
+        else:
+            sL = self.transcript_left if self.transcript_left else "(пусто)"
+            sR = self.transcript_right if self.transcript_right else "(пусто)"
+            txt.insert("1.0", f"[Левый]\n{sL}\n\n[Правый]\n{sR}")
+
+        def _save_txt():
+            path = filedialog.asksaveasfilename(
+                defaultextension=".txt",
+                filetypes=[("Text", "*.txt")]
+            )
+            if not path:
+                return
+            try:
+                if chR is None:
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(self.transcript_text or "")
+                else:
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write("[Левый]\n")
+                        f.write((self.transcript_left or "") + "\n\n")
+                        f.write("[Правый]\n")
+                        f.write(self.transcript_right or "")
+                messagebox.showinfo("Готово", f"Стенограмма сохранена: {os.path.basename(path)}")
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"Не удалось сохранить файл:\n{e}")
+
+        tk.Button(win, text="💾 Сохранить .txt", command=_save_txt).pack(pady=5)
+
+    # --- Основная обработка ---
     def process_audio(self):
         if self.original_audio_data is None:
             messagebox.showwarning("Нет файла", "Сначала загрузите аудиофайл.")
             return
 
+        # 1) Изменение скорости
         y, sr = change_audio_speed(self.original_audio_data.copy(), self.sr, self.speed_factor.get())
         self.sr = sr
 
-        y = apply_preprocessing_pipeline(y, sr, self.flag1.get(), self.flag2.get(), self.flag3.get())
+        # 2) Предобработка
+        y = apply_preprocessing_pipeline(
+            y, sr,
+            use_noise=self.flag1.get(),
+            use_norm=self.flag2.get(),
+            use_trim=self.flag3.get()
+        )
 
+        # 3) Зануление вне меток
         if self.flag4.get():
             if not self.markers:
                 messagebox.showwarning("Нет меток", "Сначала загрузите файл с метками.")
                 return
             y = apply_marker_zeroing_filter(y, sr, self.markers)
 
+        # 4) Поиск латентных интервалов
         segments, threshold, series_lines = None, None, []
+        self.current_q_segments = None
+        self.current_a_segments = None
+        q_rows, a_rows = None, None
 
         if self.flag5.get():
-            energy = np.abs(y)
-            if energy.ndim == 2:
-                if self.experiment_type.get() == "свободный":
-                    energy = energy[0]  # используем первый канал
-                smoothed = smooth_signal(energy, self.smooth_window.get())
-            else:
-                smoothed = smooth_signal(energy, self.smooth_window.get())
+            exp_type = self.experiment_type.get()
 
-            if self.experiment_type.get() == "свободный":
+            if exp_type == "свободный":
+                # ui_latent_free ожидает МОНО. Если 2ch — сведём к моно по модулю.
+                if isinstance(y, np.ndarray) and y.ndim == 2:
+                    mono = np.mean(np.abs(y), axis=0) * np.sign(np.sum(y, axis=0) + 1e-12)
+                else:
+                    mono = y
+
+                energy = np.abs(mono)
+                smoothed = smooth_signal(energy, self.smooth_window.get())
                 threshold = compute_threshold(smoothed, self.quantile.get())
                 segments = find_nonzero_segments(smoothed, sr, threshold, self.merge_threshold.get())
-            elif self.experiment_type.get() == "5:6" and self.markers:
-                if y.ndim == 1:
-                    messagebox.showerror("Ошибка", "Для режима 2ch требуется стерео (2 канала)")
+
+            elif exp_type == "5:6":
+                if y.ndim != 2 or y.shape[0] != 2:
+                    messagebox.showerror("Ошибка", "Для режима 5:6 требуется стерео (2 канала).")
                     return
-                mode = "2ch" if self.experiment_part.get() == "2 ч." else "1ch"
+
                 q_segments, a_segments = ui_latent_experiment.find_nonzero_segments_stereo(
                     y, sr, self.markers,
-                    quantile=self.quantile.get(),
-                    smooth_window=self.smooth_window.get()
+                    quantile=float(self.quantile.get()),
+                    smooth_window=int(self.smooth_window.get())
                 )
-                segments = q_segments + a_segments
+                # сохраним отдельно для UI
+                self.current_q_segments = q_segments
+                self.current_a_segments = a_segments
+
+                # для совместимости — все сегменты в один список (например, для экспорта)
+                segments = (q_segments or []) + (a_segments or [])
                 series_lines = [m[0] for m in self.markers]
 
+                # таблицы на 30 строк по каналу
+                q_rows, a_rows = [], []
+                for i in range(min(30, len(q_segments or []))):
+                    m1 = float(self.markers[i][0]) if i < len(self.markers) else None
+                    s1, e1 = q_segments[i]
+                    q_rows.append({"Начало": s1, "Метка": (m1 if m1 is not None else "-"), "Конец": e1})
+                for i in range(min(30, len(a_segments or []))):
+                    m1 = float(self.markers[i][0]) if i < len(self.markers) else None
+                    if i < len(self.markers) - 1:
+                        m2 = float(self.markers[i + 1][0])
+                        m_str = f"{m1:.3f} → {m2:.3f}"
+                    else:
+                        m_str = f"{m1:.3f} → END" if m1 is not None else "-"
+                    s2, e2 = a_segments[i]
+                    a_rows.append({"Начало": s2, "Метка": m_str, "Конец": e2})
+
+                # 💾 Нарезка аудио (вопросы/ответы) — по завершении обработки
+                try:
+                    base = os.path.splitext(os.path.basename(self.filepath))[0] if self.filepath else "audio"
+                    out_dir_base = filedialog.askdirectory(title="Папка для нарезанных фрагментов (Q/A)")
+                    if out_dir_base:
+                        out_dir = os.path.join(out_dir_base, f"{base}_segments")
+                        ui_latent_experiment.export_segments_to_files(y, sr, q_segments, a_segments, out_dir)
+                        messagebox.showinfo("Нарезка завершена", f"Файлы сохранены в папку:\n{out_dir}")
+                except Exception as e:
+                    messagebox.showwarning("Нарезка не выполнена", f"Не удалось сохранить фрагменты:\n{e}")
+
+        # 5) Обновление состояния и график
         self.audio_data = y
         self.current_segments = segments
-        draw_waveform(self, segments=segments, threshold=threshold, series_lines=series_lines)
+
+        # Для моно: подсветка в единственном графике (segments)
+        # Для 5:6: подсветка разнесена — q_segments на 1-й, a_segments на 2-й
+        draw_waveform(
+            self,
+            segments=segments if self.experiment_type.get() == "свободный" else None,
+            threshold=threshold,
+            series_lines=series_lines,
+            q_segments=self.current_q_segments,
+            a_segments=self.current_a_segments
+        )
+
+        # Таблицы — только для 5:6
+        if q_rows is not None and a_rows is not None:
+            show_latent_tables(self, q_rows, a_rows)
+
         messagebox.showinfo("Готово", "Обработка завершена!")
 
+    # --- Экспорт отчёта ---
     def export_report(self):
         if not self.current_segments:
             messagebox.showerror("Ошибка", "Сначала выполните обработку аудио.")
@@ -161,26 +398,119 @@ class AudioApp:
         stats = df_segments["Длительность (сек)"].describe().rename("Статистика")
         df_stats = pd.DataFrame(stats)
 
+        # Длительность файла с учётом формата (C, N) или (N,)
+        if isinstance(self.audio_data, np.ndarray) and self.audio_data.ndim == 2:
+            length_samples = self.audio_data.shape[1]
+        else:
+            length_samples = len(self.audio_data)
+
         df_metrics = pd.DataFrame([{
             "Файл": os.path.basename(self.filepath),
             "Частота": self.sr,
-            "Длительность": len(self.audio_data[0] if self.audio_data.ndim == 2 else self.audio_data) / self.sr,
+            "Длительность (сек)": length_samples / self.sr,
             "Скорость": self.speed_factor.get(),
             "Квантиль": self.quantile.get(),
-            "Сглаживание": self.smooth_window.get(),
-            "Тип": self.experiment_type.get(),
+            "Сглаживание (окно)": self.smooth_window.get(),
+            "Тип эксперимента": self.experiment_type.get(),
             "Часть": self.experiment_part.get()
         }])
 
-        df_phonemes = self.phoneme_table.copy() if self.phoneme_table is not None else pd.DataFrame([{"Фонемы": "не проводился"}])
+        # Базовая «общая» таблица фонем (если есть)
+        df_phonemes = (
+            self.phoneme_table.copy()
+            if self.phoneme_table is not None
+            else pd.DataFrame([{"Фонемы": "не проводился"}])
+        )
 
-        with pd.ExcelWriter(save_path) as writer:
-            df_metrics.to_excel(writer, sheet_name="Метрики", index=False)
-            df_segments.to_excel(writer, sheet_name="Интервалы", index=False)
-            df_stats.to_excel(writer, sheet_name="Статистика")
-            df_phonemes.to_excel(writer, sheet_name="Фонемы", index=False)
+        # Стенограммы (чистый текст)
+        if self.transcript_left is not None or self.transcript_right is not None:
+            df_transcript_L = pd.DataFrame([{"Стенограмма (левый)": self.transcript_left or ""}])
+            df_transcript_R = pd.DataFrame([{"Стенограмма (правый)": self.transcript_right or ""}])
+        else:
+            df_transcript_L = None
+            df_transcript_R = None
 
-        messagebox.showinfo("Отчёт", f"Сохранён: {os.path.basename(save_path)}")
+        df_transcript = pd.DataFrame([{"Стенограмма": self.transcript_text}]) if self.transcript_text else pd.DataFrame([{"Стенограмма": ""}])
+
+        # По-канальные фонемные таблицы (если считали в make_transcript)
+        df_phonemes_L = self.phoneme_table_left.copy() if self.phoneme_table_left is not None else None
+        df_phonemes_R = self.phoneme_table_right.copy() if self.phoneme_table_right is not None else None
+
+        # Надёжная запись Excel с fallback'ами (без обязательного xlsxwriter)
+        wrote = False
+        try:
+            with pd.ExcelWriter(save_path) as writer:
+                df_metrics.to_excel(writer, sheet_name="Метрики", index=False)
+                df_segments.to_excel(writer, sheet_name="Интервалы", index=False)
+                df_stats.to_excel(writer, sheet_name="Статистика")
+                df_phonemes.to_excel(writer, sheet_name="Фонемы", index=False)
+                # стенограммы
+                if df_transcript_L is not None and df_transcript_R is not None:
+                    df_transcript_L.to_excel(writer, sheet_name="Стенограмма_L", index=False)
+                    df_transcript_R.to_excel(writer, sheet_name="Стенограмма_R", index=False)
+                else:
+                    df_transcript.to_excel(writer, sheet_name="Стенограмма", index=False)
+                # по-канальные фонемы
+                if df_phonemes_L is not None:
+                    df_phonemes_L.to_excel(writer, sheet_name="Фонемы_L", index=False)
+                if df_phonemes_R is not None:
+                    df_phonemes_R.to_excel(writer, sheet_name="Фонемы_R", index=False)
+            wrote = True
+        except Exception:
+            pass
+
+        if not wrote:
+            try:
+                with pd.ExcelWriter(save_path, engine="openpyxl") as writer:
+                    df_metrics.to_excel(writer, sheet_name="Метрики", index=False)
+                    df_segments.to_excel(writer, sheet_name="Интервалы", index=False)
+                    df_stats.to_excel(writer, sheet_name="Статистика")
+                    df_phonemes.to_excel(writer, sheet_name="Фонемы", index=False)
+                    if df_transcript_L is not None and df_transcript_R is not None:
+                        df_transcript_L.to_excel(writer, sheet_name="Стенограмма_L", index=False)
+                        df_transcript_R.to_excel(writer, sheet_name="Стенограмма_R", index=False)
+                    else:
+                        df_transcript.to_excel(writer, sheet_name="Стенограмма", index=False)
+                    if df_phonemes_L is not None:
+                        df_phonemes_L.to_excel(writer, sheet_name="Фонемы_L", index=False)
+                    if df_phonemes_R is not None:
+                        df_phonemes_R.to_excel(writer, sheet_name="Фонемы_R", index=False)
+                wrote = True
+            except Exception:
+                pass
+
+        if not wrote:
+            base = os.path.splitext(save_path)[0]
+            out_dir = base + "_csv_export"
+            os.makedirs(out_dir, exist_ok=True)
+            try:
+                df_metrics.to_csv(os.path.join(out_dir, "metrics.csv"), index=False)
+                df_segments.to_csv(os.path.join(out_dir, "segments.csv"), index=False)
+                df_stats.to_csv(os.path.join(out_dir, "stats.csv"))
+                df_phonemes.to_csv(os.path.join(out_dir, "phonemes.csv"), index=False)
+                # стенограммы
+                if df_transcript_L is not None and df_transcript_R is not None:
+                    df_transcript_L.to_csv(os.path.join(out_dir, "transcript_left.csv"), index=False)
+                    df_transcript_R.to_csv(os.path.join(out_dir, "transcript_right.csv"), index=False)
+                else:
+                    df_transcript.to_csv(os.path.join(out_dir, "transcript.csv"), index=False)
+                # по-канальные фонемы
+                if df_phonemes_L is not None:
+                    df_phonemes_L.to_csv(os.path.join(out_dir, "phonemes_left.csv"), index=False)
+                if df_phonemes_R is not None:
+                    df_phonemes_R.to_csv(os.path.join(out_dir, "phonemes_right.csv"), index=False)
+
+                messagebox.showwarning(
+                    "Excel недоступен",
+                    f"Библиотеки Excel-движка не найдены. Данные выгружены в CSV:\n{out_dir}"
+                )
+                wrote = True
+            except Exception as e:
+                messagebox.showerror("Ошибка экспорта", f"Не удалось сохранить ни в XLSX, ни в CSV:\n{e}")
+                return
+
+        if wrote:
+            messagebox.showinfo("Отчёт", f"Сохранён: {os.path.basename(save_path)}")
 
     def plot_series_segments(self):
         plot_series_segments(self)
