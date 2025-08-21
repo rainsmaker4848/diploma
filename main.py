@@ -6,6 +6,11 @@ import os
 import re
 from tkinter import messagebox, filedialog
 
+# --- 🖼️ Добавлено: безвыводная отрисовка графиков в файлы ---
+import matplotlib
+matplotlib.use("Agg")  # чтобы не открывать окна при сохранении картинок
+import matplotlib.pyplot as plt
+
 # --- 🔧 Импорт внутренних модулей ---
 from ui_buttons import setup_interface
 from ui_player import load_audio, save_audio, play_audio
@@ -347,16 +352,64 @@ class AudioApp:
                     s2, e2 = a_segments[i]
                     a_rows.append({"Начало": s2, "Метка": m_str, "Конец": e2})
 
-                # 💾 Нарезка аудио (вопросы/ответы) — по завершении обработки
+                # 💾 Нарезка аудио (вопросы/ответы) + сохранение картинок графиков фрагментов
                 try:
                     base = os.path.splitext(os.path.basename(self.filepath))[0] if self.filepath else "audio"
-                    out_dir_base = filedialog.askdirectory(title="Папка для нарезанных фрагментов (Q/A)")
+                    out_dir_base = filedialog.askdirectory(title="Папка для нарезанных фрагментов (Q/A) и графиков")
                     if out_dir_base:
                         out_dir = os.path.join(out_dir_base, f"{base}_segments")
                         ui_latent_experiment.export_segments_to_files(y, sr, q_segments, a_segments, out_dir)
-                        messagebox.showinfo("Нарезка завершена", f"Файлы сохранены в папку:\n{out_dir}")
+
+                        # --- Добавлено: сохраняем PNG-графики каждого фрагмента ---
+                        def _downsample(arr: np.ndarray, max_points: int = 200_000):
+                            n = arr.shape[-1]
+                            if n <= max_points:
+                                return arr, 1
+                            step = int(np.ceil(n / max_points))
+                            return arr[::step], step
+
+                        def _save_plot(sig_1d: np.ndarray, sr: int, t0: float, t1: float, filepath_png: str, title: str):
+                            s = max(0, int(t0 * sr))
+                            e = min(len(sig_1d), int(t1 * sr))
+                            if e <= s:
+                                return
+                            seg = sig_1d[s:e]
+                            seg_ds, step = _downsample(seg)
+                            t = (np.arange(len(seg_ds)) * step) / float(sr) + t0  # абсолютное время
+                            fig = plt.figure(figsize=(10, 3), dpi=120)
+                            plt.plot(t, seg_ds, linewidth=0.9)
+                            plt.title(title)
+                            plt.xlabel("Время (сек)")
+                            plt.ylabel("Амплитуда")
+                            plt.tight_layout()
+                            fig.savefig(filepath_png)
+                            plt.close(fig)
+
+                        # каналы (вопросы — левый 0, ответы — правый 1)
+                        if y.ndim == 2 and y.shape[0] == 2:
+                            ch_q = y[0]
+                            ch_a = y[1]
+                        else:
+                            # на всякий случай: моно
+                            ch_q = y[0] if y.ndim == 2 else y
+                            ch_a = y[0] if y.ndim == 2 else y
+
+                        # сохранить PNG для каждого вопроса
+                        for i, (s1, e1) in enumerate(q_segments, start=1):
+                            png_path = os.path.join(out_dir, f"question_{i:02d}.png")
+                            _save_plot(ch_q, sr, float(s1), float(e1), png_path, f"Вопрос {i}: {s1:.2f}–{e1:.2f} c")
+
+                        # сохранить PNG для каждого ответа
+                        for i, (s2, e2) in enumerate(a_segments, start=1):
+                            png_path = os.path.join(out_dir, f"answer_{i:02d}.png")
+                            _save_plot(ch_a, sr, float(s2), float(e2), png_path, f"Ответ {i}: {s2:.2f}–{e2:.2f} c")
+
+                        messagebox.showinfo(
+                            "Нарезка завершена",
+                            f"Файлы сохранены в папку:\n{out_dir}\n(аудио и PNG-графики каждого фрагмента)"
+                        )
                 except Exception as e:
-                    messagebox.showwarning("Нарезка не выполнена", f"Не удалось сохранить фрагменты:\n{e}")
+                    messagebox.showwarning("Нарезка не выполнена", f"Не удалось сохранить фрагменты/графики:\n{e}")
 
         # 5) Обновление состояния и график
         self.audio_data = y

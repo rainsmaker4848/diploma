@@ -193,6 +193,110 @@ def find_segments_in_window(
 
 
 # =========================
+# 🔊 Вычитание цикличного шума (канал 2)
+# =========================
+def subtract_periodic_noise_from_channel(
+    chan: np.ndarray,
+    sr: int,
+    markers: list,
+    learn_seconds: float = 3.0,
+    pre_margin: float = 0.5,
+    fmin_hz: float = 40.0,
+    fmax_hz: float = 500.0,
+    adapt_window_periods: int = 12
+):
+    """
+    Оценка и вычитание периодического (цикличного) шума.
+    1) Берём участок ДО первой метки (на втором канале): [m0 - pre_margin - learn_seconds, m0 - pre_margin]
+    2) По автокорреляции оцениваем период T (в сэмплах), ограничивая частоты [fmin_hz, fmax_hz].
+    3) Строим средний шаблон одного периода и вычитаем его из всего канала (с адаптивной нормировкой по окнам).
+
+    Возвращает (chan_clean, info_dict).
+    """
+    n = len(chan)
+    if n == 0 or len(markers) == 0:
+        return chan.copy(), {"status": "no_data"}
+
+    m0 = float(markers[0][0])
+    end_t = max(0.0, m0 - pre_margin)
+    start_t = max(0.0, end_t - learn_seconds)
+    s = int(start_t * sr)
+    e = int(end_t * sr)
+    if e <= s + 10:
+        return chan.copy(), {"status": "no_learn_segment"}
+
+    learn = chan[s:e].astype(np.float32)
+    learn = learn - np.mean(learn)  # центрируем
+
+    # рамки периодов
+    pmin = max(2, int(sr / fmax_hz))
+    pmax = max(pmin + 1, int(sr / fmin_hz))
+
+    # автокорреляция (нормированная)
+    ac = np.correlate(learn, learn, mode='full')
+    ac = ac[len(ac)//2:]  # лаги >= 0
+    ac = ac / (np.max(ac) + 1e-9)
+
+    # ищем лаг с максимумом в [pmin, pmax)
+    search = ac[pmin:min(len(ac), pmax)]
+    if len(search) == 0 or np.all(np.isnan(search)):
+        return chan.copy(), {"status": "no_peak"}
+
+    lag = int(np.argmax(search)) + pmin
+    period = max(2, lag)
+
+    # строим средний шаблон одного периода
+    n_cycles = (len(learn) // period)
+    if n_cycles < 2:
+        return chan.copy(), {"status": "few_cycles"}
+
+    trimmed = learn[:n_cycles * period]
+    template = trimmed.reshape(n_cycles, period).mean(axis=0)
+    template = template - np.mean(template)
+
+    # подготовим тайлы на всю длину сигнала
+    reps = (n + period - 1) // period
+    tiled = np.tile(template, reps)[:n]
+
+    # Адаптивная нормировка по окнам (чтобы не «пересубтракнуть»)
+    win_len = max(period * adapt_window_periods, period * 6)
+    hop = win_len // 3
+    chan = chan.astype(np.float32)
+    out = np.zeros_like(chan)
+    wsum = np.zeros_like(chan)
+
+    # окно Ханна для мягкой склейки
+    hann = (0.5 - 0.5 * np.cos(2 * np.pi * np.arange(win_len) / max(1, (win_len - 1)))).astype(np.float32)
+
+    for start in range(0, n, hop):
+        end = min(n, start + win_len)
+        seg = chan[start:end]
+        tmp = tiled[start:end]
+        if len(seg) < 8:
+            break
+        # alpha = <seg,tmp> / <tmp,tmp> (LS)
+        denom = float(np.dot(tmp, tmp)) + 1e-9
+        alpha = float(np.dot(seg, tmp) / denom)
+        clean = seg - alpha * tmp
+        # окно для склейки
+        w = hann[:len(clean)]
+        out[start:end] += clean * w
+        wsum[start:end] += w
+
+    nz = (wsum > 1e-9)
+    out[nz] /= wsum[nz]
+    out[~nz] = chan[~nz]
+
+    info = {
+        "status": "ok",
+        "period_samples": period,
+        "period_hz": float(sr) / float(period),
+        "learn_segment": (start_t, end_t),
+    }
+    return out.astype(np.float32, copy=False), info
+
+
+# =========================
 # 🧠 Главная функция 2ch эксперимента
 # =========================
 def find_nonzero_segments_stereo(
@@ -202,15 +306,16 @@ def find_nonzero_segments_stereo(
     quantile: float = 0.99,
     smooth_window: int = 5,
     buffer_sec: float = 3,
-    clean_ch2_periodic_noise: bool = True  # оставлено для совместимости; не используется
+    clean_ch2_periodic_noise: bool = True
 ):
     """
     Основная логика для 2-х участников:
       - Канал 1 (левый): вопросы — окно вокруг каждой метки [mi-buffer_sec, mi+buffer_sec]
-      - Канал 2 (правый): ответы — суженное окно:
-            от конца окна вокруг метки (mi + buffer_sec)
-            до середины промежутка между (mi + buffer_sec) и (m(i+1) - buffer_sec)
-        Для последней метки — [mi + buffer_sec, конец правого канала]
+      - Канал 2 (правый): ответы — ОКНО ФИКС. ДЛИНЫ 1.5 c после конца вопроса:
+            start_a = end_q
+            end_a   = start_a + 1.5
+        Порог для 2-го канала повышенный: quantile_ch2 = max(0.99, quantile).
+        Для последней метки — логика та же (окно после её вопроса).
 
     markers: список кортежей (start, end) — берём start (метка_i)
     Возвращает: (q_segments, a_segments) — списки кортежей (t_start, t_end), сек.
@@ -229,9 +334,22 @@ def find_nonzero_segments_stereo(
     left = signal_stereo[0].astype(np.float32, copy=False)
     right_raw = signal_stereo[1].astype(np.float32, copy=False)
 
-    # Левый/правый — модуль + сглаживание (без «линии уровня»)
+    # Левый — по модулю + сглаживание
     sm_left = smooth_signal(np.abs(left), smooth_window)
-    sm_right = smooth_signal(np.abs(right_raw), smooth_window)
+
+    # Правый: опционально очищаем цикличный шум, затем берём модуль и сглаживаем
+    if clean_ch2_periodic_noise and len(markers) > 0:
+        right_clean, _ = subtract_periodic_noise_from_channel(
+            right_raw, sr, markers,
+            learn_seconds=3.0,
+            pre_margin=0.6,
+            fmin_hz=40.0,
+            fmax_hz=500.0,
+            adapt_window_periods=12
+        )
+        sm_right = smooth_signal(np.abs(right_clean), window_size=max(3, smooth_window))
+    else:
+        sm_right = smooth_signal(np.abs(right_raw), smooth_window)
 
     dur_sec_left = len(left) / float(sr)
     dur_sec_right = len(right_raw) / float(sr)
@@ -239,30 +357,33 @@ def find_nonzero_segments_stereo(
     q_segments = []
     a_segments = []
 
+    # Повышенный порог для канала 2
+    quantile_ch2 = max(0.99, float(quantile))
+
     for i in range(len(markers)):
         m1 = float(markers[i][0])
 
         # --- ВОПРОС (канал 1): [mi - buffer_sec, mi + buffer_sec] ---
         start_q = max(0.0, m1 - buffer_sec)
-        end_q = min(m1 + buffer_sec, dur_sec_left)
-        seg_q = find_segments_in_window(sm_left, sr, start_q, end_q,
-                                        initial_q=quantile, min_duration=0.5)
-        q_segments.append(seg_q[0])  # гарантированно один
+        end_q   = min(m1 + buffer_sec, dur_sec_left)
+        seg_q = find_segments_in_window(
+            sm_left, sr, start_q, end_q,
+            initial_q=float(quantile),
+            min_duration=0.5
+        )
+        # гарантированно один
+        q_s, q_e = seg_q[0]
+        q_segments.append((q_s, q_e))
 
-        # --- ОТВЕТ (канал 2): от (mi + buffer_sec) до середины с (m(i+1) - buffer_sec) ---
-        if i < len(markers) - 1:
-            m2 = float(markers[i + 1][0])
-            start_a_edge = m1 + buffer_sec
-            end_a_edge = m2 - buffer_sec
-            mid = 0.5 * (start_a_edge + end_a_edge)
-            start_a = max(0.0, start_a_edge)
-            end_a = max(start_a, min(mid, dur_sec_right))
-        else:
-            start_a = max(0.0, m1 + buffer_sec)
-            end_a = dur_sec_right
+        # --- ОТВЕТ (канал 2): окно фиксированной длины 1.5 c ПОСЛЕ конца вопроса ---
+        start_a = max(0.0, float(q_e))
+        end_a   = min(dur_sec_right, start_a + 1.5)
 
-        seg_a = find_segments_in_window(sm_right, sr, start_a, end_a,
-                                        initial_q=quantile, min_duration=0.4)
+        seg_a = find_segments_in_window(
+            sm_right, sr, start_a, end_a,
+            initial_q=quantile_ch2,   # повышенный порог
+            min_duration=0.4
+        )
         a_segments.append(seg_a[0])  # гарантированно один
 
     return q_segments, a_segments
