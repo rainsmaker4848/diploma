@@ -17,7 +17,7 @@ from ui_player import load_audio, save_audio, play_audio
 from ui_markers import load_markers_from_file
 from ui_plot import draw_waveform, plot_series_segments, show_latent_tables
 from ui_speed import change_audio_speed
-from ui_phoneme_analysis import PhonemeAnalyzer
+from ui_phoneme_analysis import PhonemeAnalyzer   # <-- WhisperX-вариант
 from ui_slice_filter import apply_marker_zeroing_filter
 
 # ВНИМАНИЕ: ui_latent_free работает с МОНО (1D)!
@@ -132,6 +132,8 @@ class AudioApp:
         analyzer = PhonemeAnalyzer(self.root, self.audio_data, self.sr)
         analyzer.analyze()
         self.phoneme_table = analyzer.get_phoneme_dataframe()
+        # если моно, можно сразу собрать стенограмму из сегментов WhisperX:
+        self.transcript_text = analyzer.get_transcript_text(pause_threshold=0.7)
 
     # --- Вспомогательное: превращаем (C,N) в отдельные 1D каналы ---
     def _split_channels(self, y):
@@ -151,56 +153,11 @@ class AudioApp:
             return y, None
         return None, None
 
-    # --- Построение стенограммы на основе таблицы фонем (чистый текст) ---
-    def _infer_transcript_from_df(self, df: pd.DataFrame) -> str:
-        if df is None or df.empty:
-            return ""
-
-        # Найдём колонку с символами
-        candidate_cols = ["char", "symbol", "phoneme", "text", "label"]
-        col = None
-        for c in candidate_cols:
-            if c in df.columns:
-                col = c
-                break
-        if col is None:
-            # если нет явной колонки, попробуем первую строковую
-            for c in df.columns:
-                if df[c].dtype == object:
-                    col = c
-                    break
-        if col is None:
-            return ""
-
-        tokens = df[col].astype(str).tolist()
-
-        # Простейшая нормализация пробелов/служебных токенов
-        space_like = {"<sp>", "<space>", "sp", "space", "_", "[sp]", "<blank>"}
-        text = []
-        for t in tokens:
-            tt = t.strip()
-            if tt == "" or tt.lower() in space_like:
-                text.append(" ")
-            else:
-                text.append(tt)
-
-        # Склейка и лёгкая чистка
-        s = "".join(text)
-        s = re.sub(r"\s+", " ", s)          # схлопнуть множественные пробелы
-        s = re.sub(r"\s+([.,!?;:])", r"\1", s)  # убрать пробелы перед пунктуацией
-        s = s.strip()
-
-        # Капитализация первой буквы, если есть
-        if len(s) > 0:
-            s = s[0].upper() + s[1:]
-
-        return s
-
+    # --- Построение стенограммы (WhisperX, пробелы/переносы из сегментов) ---
     def make_transcript(self):
         """
-        Построить стенограмму:
-        - если стерео: делаем отдельно для Л и П каналов -> две строки + показ в одном окне
-        - если моно: как раньше (self.transcript_text)
+        Если стерео — считаем по каждому каналу отдельно.
+        Если моно — один раз по всему сигналу.
         """
         if self.audio_data is None:
             messagebox.showwarning("Нет аудио", "Сначала загрузите и обработайте аудиофайл.")
@@ -216,7 +173,8 @@ class AudioApp:
                 analyzerL = PhonemeAnalyzer(self.root, chL, self.sr)
                 analyzerL.analyze()
                 self.phoneme_table_left = analyzerL.get_phoneme_dataframe()
-                self.transcript_left = self._infer_transcript_from_df(self.phoneme_table_left)
+                # ключевая строка: аккуратная стенограмма из сегментов WhisperX
+                self.transcript_left = analyzerL.get_transcript_text(pause_threshold=0.7)
             except Exception as e:
                 print(f"[Transcript L] Ошибка: {e}")
 
@@ -228,7 +186,7 @@ class AudioApp:
                 analyzerR = PhonemeAnalyzer(self.root, chR, self.sr)
                 analyzerR.analyze()
                 self.phoneme_table_right = analyzerR.get_phoneme_dataframe()
-                self.transcript_right = self._infer_transcript_from_df(self.phoneme_table_right)
+                self.transcript_right = analyzerR.get_transcript_text(pause_threshold=0.7)
             except Exception as e:
                 print(f"[Transcript R] Ошибка: {e}")
 
@@ -236,7 +194,7 @@ class AudioApp:
         if chR is None and self.transcript_left is not None:
             self.transcript_text = self.transcript_left
 
-        # Показ в отдельном окне (только текст, без процентов/длин)
+        # Показ в отдельном окне (только текст)
         win = tk.Toplevel(self.root)
         win.title("Стенограмма (по каналам)")
         txt = tk.Text(win, wrap="word", height=25)
@@ -415,8 +373,6 @@ class AudioApp:
         self.audio_data = y
         self.current_segments = segments
 
-        # Для моно: подсветка в единственном графике (segments)
-        # Для 5:6: подсветка разнесена — q_segments на 1-й, a_segments на 2-й
         draw_waveform(
             self,
             segments=segments if self.experiment_type.get() == "свободный" else None,

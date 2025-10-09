@@ -172,8 +172,194 @@ def show_latent_tables(app, q_rows, a_rows):
     _build_interval_tables(win, rows_q, rows_a)
 
 
+# ===============================
+# Интерактивный график
+# ===============================
+class _InteractiveWaveform:
+    """
+    Создаёт фигуру один раз. Далее:
+      - колёсико = прокрутка xlim
+      - Ctrl + колёсико = зум к курсору
+      - клик ЛКМ = переставить плейхед (app.playhead_time)
+      - update_playhead(t) двигает красную линию без полной перерисовки
+    """
+    def __init__(self, app):
+        self.app = app
+        self.fig = None
+        self.canvas = None
+        self.axs = None
+        self.lines_proc = []
+        self.lines_orig = []
+        self.playhead_lines = []
+        self.t_ds = None
+        self.sr = None
+        self.is_stereo = False
+        self.n_samples = 0
+        self.max_points = 400_000
+
+    # критерий, нужно ли пересоздавать
+    def needs_rebuild(self, sr, n_samples, is_stereo):
+        return (self.fig is None) or (self.sr != sr) or (self.n_samples != n_samples) or (self.is_stereo != is_stereo)
+
+    def build(self, segments=None, threshold=None, series_lines=None,
+              q_segments=None, a_segments=None):
+        # очистка контейнера
+        for w in self.app.canvas_frame.winfo_children():
+            w.destroy()
+
+        y = _ensure_2d_channels_first(self.app.audio_data)
+        y0 = _ensure_2d_channels_first(self.app.original_audio_data)
+        self.sr = self.app.sr
+        if y is None or self.sr is None:
+            return
+
+        self.is_stereo = (y.shape[0] == 2)
+        self.n_samples = y.shape[1]
+        n_ch = 2 if self.is_stereo else 1
+
+        # общая ось времени по каналу 0
+        sig0_ds, step0 = _downsample_for_plot(y[0] if self.is_stereo else y[0], self.max_points)
+        self.t_ds = _seconds_axis(len(sig0_ds), self.sr, step0)
+
+        # создаём фигуру
+        self.fig, self.axs = plt.subplots(n_ch, 1, figsize=(12, 6 if self.is_stereo else 4), dpi=100, sharex=True)
+        if not isinstance(self.axs, np.ndarray):
+            self.axs = np.array([self.axs])
+
+        self.lines_proc, self.lines_orig, self.playhead_lines = [], [], []
+
+        # рисуем каналы
+        for ch in range(n_ch):
+            sig_p = y[ch] if self.is_stereo else y[0]
+            sig_p_ds, step = _downsample_for_plot(sig_p, self.max_points)
+            lp, = self.axs[ch].plot(self.t_ds[:len(sig_p_ds)], sig_p_ds, label='Обработанный', alpha=0.9)
+            self.lines_proc.append(lp)
+
+            lo = None
+            if y0 is not None:
+                sig_o = y0[ch] if self.is_stereo else y0[0]
+                if sig_o is not None:
+                    sig_o_ds, _ = _downsample_for_plot(sig_o, self.max_points)
+                    m = min(len(sig_o_ds), len(self.t_ds))
+                    lo, = self.axs[ch].plot(self.t_ds[:m], sig_o_ds[:m], label='Оригинал', alpha=0.5)
+            self.lines_orig.append(lo)
+
+            self.axs[ch].set_ylabel(f"Канал {ch+1}" if self.is_stereo else "Амплитуда")
+
+            # плейхед (вертикальная линия)
+            ph, = self.axs[ch].plot([0, 0], [0, 0], color='red', linewidth=2, alpha=0.9)
+            self.playhead_lines.append(ph)
+
+        # подсветки сегментов
+        if not self.is_stereo:
+            if segments:
+                for s, e in segments:
+                    self.axs[0].axvspan(s, e, facecolor='green', alpha=0.2)
+        else:
+            if q_segments:
+                for s, e in q_segments:
+                    self.axs[0].axvspan(s, e, facecolor='green', alpha=0.25)
+            if a_segments:
+                for s, e in a_segments:
+                    self.axs[1].axvspan(s, e, facecolor='orange', alpha=0.25)
+
+        if threshold is not None:
+            self.axs[0].axhline(threshold, color='purple', linestyle='--', label='Порог')
+
+        if getattr(self.app, "display_markers", None):
+            for ch in range(n_ch):
+                ax = self.axs[ch]
+                for x, label in self.app.display_markers:
+                    ax.axvline(x, color='yellow', linestyle='-', linewidth=0.8)
+                    ax.axvspan(x - 3.5, x + 3.5, facecolor='grey', alpha=0.08, hatch='////')
+                    ax.text(x, 0.95, label, transform=ax.get_xaxis_transform(),
+                            rotation=90, va='top', ha='center', fontsize=8, color='darkorange')
+
+        if series_lines:
+            for x in series_lines:
+                self.axs[0].axvline(x, color='purple', linestyle='-.', linewidth=1.5)
+
+        self.axs[-1].set_xlabel("Время (сек)")
+        self.axs[0].set_title("Сигнал: оригинал vs обработанный")
+        self.axs[0].legend(loc='upper right')
+        self.fig.tight_layout()
+
+        # embed
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.app.canvas_frame)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        # события
+        self.fig.canvas.mpl_connect('scroll_event', self._on_scroll)
+        self.fig.canvas.mpl_connect('button_press_event', self._on_click)
+
+        # начальная позиция плейхеда
+        self.update_playhead(getattr(self.app, "playhead_time", None))
+
+        # xlim по умолчанию — весь диапазон
+        xmax = self.t_ds[-1] if len(self.t_ds) else 1.0
+        for ax in self.axs:
+            ax.set_xlim(0, xmax)
+        self.canvas.draw_idle()
+
+    # --- интерактив ---
+    def _on_scroll(self, event):
+        # определяем направление
+        step_val = 0
+        if hasattr(event, "step") and event.step is not None:
+            step_val = 1 if event.step > 0 else -1
+        else:
+            # старые бэкенды: event.button in {'up','down'}
+            step_val = 1 if getattr(event, "button", "up") == "up" else -1
+
+        # масштаб/панорамирование
+        key = (event.key or "").lower() if hasattr(event, "key") else ""
+        is_ctrl = ("control" in key) or ("ctrl" in key)
+
+        ax = event.inaxes or (self.axs[-1] if len(self.axs) else None)
+        if ax is None:
+            return
+
+        xmin, xmax = ax.get_xlim()
+        span = max(1e-6, xmax - xmin)
+        center = float(event.xdata) if event.xdata is not None else (xmin + xmax) / 2.0
+
+        if is_ctrl:
+            # Zoom к курсору
+            scale = 0.9 if step_val > 0 else 1.1
+            new_span = max(1e-3, span * scale)
+            left = center - (center - xmin) * (new_span / span)
+            right = left + new_span
+            for a in self.axs:
+                a.set_xlim(left, right)
+        else:
+            # Панорамирование
+            shift = span * 0.1 * (-1 if step_val > 0 else 1)
+            for a in self.axs:
+                a.set_xlim(xmin + shift, xmax + shift)
+
+        self.canvas.draw_idle()
+
+    def _on_click(self, event):
+        if event.inaxes is None or event.xdata is None:
+            return
+        # клик — устанавливаем плейхед
+        t = max(0.0, float(event.xdata))
+        self.app.playhead_time = t
+        self.update_playhead(t)
+
+    def update_playhead(self, t):
+        if t is None:
+            t = -1e9  # спрятать линию
+        for ax, ph in zip(self.axs, self.playhead_lines):
+            ymin, ymax = ax.get_ylim()
+            ph.set_data([t, t], [ymin, ymax])
+        if self.canvas:
+            self.canvas.draw_idle()
+
+
 # ------------------------------
-# Основной график
+# Основной API
 # ------------------------------
 def draw_waveform(
     app,
@@ -184,127 +370,57 @@ def draw_waveform(
     q_segments=None,
     a_segments=None,
     segments_ch2=None,   # оставлено для обратной совместимости
+    playhead_time=None,  # позиция плейхеда в секундах
 ):
     """
-    Рисует волны оригинала и обработанного сигнала.
-    - Если моно (свободный режим): 'segments' подсвечиваются на единственном графике.
-    - Если стерео (5:6): подсветка разнесена по каналам:
-        левый — вопросы (q_segments), правый — ответы (a_segments/segments_ch2).
-      Если q_segments/a_segments не переданы, пытаемся взять из app.current_q_segments / app.current_a_segments.
-    Память экономится за счёт прореживания (max_points_per_channel).
+    Интерактивный график:
+      - первый вызов создаёт фигуру;
+      - повторные вызовы без параметров просто двигают плейхед (без полной перерисовки);
+      - если данные/режим поменялись или переданы новые сегменты/порог — график пересобирается.
     """
-    # очищаем контейнер
-    for w in app.canvas_frame.winfo_children():
-        w.destroy()
-
     y = _ensure_2d_channels_first(app.audio_data)
-    y_orig = _ensure_2d_channels_first(app.original_audio_data)
     sr = getattr(app, "sr", None)
     if y is None or sr is None:
         return
 
+    # дефолт плейхеда
+    if playhead_time is None:
+        playhead_time = getattr(app, "playhead_time", None)
+
     is_stereo = (y.shape[0] == 2)
-    n_ch = 2 if is_stereo else 1
+    n_samples = y.shape[1]
 
-    # Попытка автоматически взять q/a интервалы из приложения
-    if q_segments is None:
-        q_segments = getattr(app, "current_q_segments", None)
-    if a_segments is None:
-        a_segments = getattr(app, "current_a_segments", None)
-    if a_segments is None and segments_ch2 is not None:
-        a_segments = segments_ch2
+    force_rebuild = any(v is not None for v in (segments, threshold, series_lines, q_segments, a_segments, segments_ch2))
 
-    # Создаём фигуру
-    fig, axs = plt.subplots(
-        n_ch, 1,
-        figsize=(12, 6 if is_stereo else 4),
-        dpi=100,
-        sharex=True
-    )
-    if not isinstance(axs, np.ndarray):
-        axs = np.array([axs])
-
-    # Прореживаем и рисуем
-    for ch in range(n_ch):
-        sig_proc = y[ch] if is_stereo else y[0]
-        sig_orig = y_orig[ch] if (y_orig is not None and is_stereo) else (y_orig[0] if y_orig is not None else None)
-
-        sig_proc_ds, step = _downsample_for_plot(sig_proc, max_points_per_channel)
-        t_ds = _seconds_axis(len(sig_proc_ds), sr, step)
-
-        axs[ch].plot(t_ds, sig_proc_ds, label='Обработанный', alpha=0.9)
-
-        if sig_orig is not None:
-            sig_orig_ds, _ = _downsample_for_plot(sig_orig, max_points_per_channel)
-            m = min(len(sig_orig_ds), len(t_ds))
-            axs[ch].plot(t_ds[:m], sig_orig_ds[:m], label='Оригинал', alpha=0.5)
-
-        axs[ch].set_ylabel(f"Канал {ch+1}" if is_stereo else "Амплитуда")
-
-    # --- Подсветка интервалов ---
-    if not is_stereo:
-        # моно («свободный») — подсвечиваем на единственном графике
-        if segments:
-            for start, end in segments:
-                axs[0].axvline(start, color='green', linestyle='--', linewidth=1)
-                axs[0].axvline(end, color='red', linestyle='--', linewidth=1)
-                axs[0].axvspan(start, end, facecolor='green', alpha=0.2)
+    if not hasattr(app, "_interactive_plot"):
+        app._interactive_plot = _InteractiveWaveform(app)
+        app._interactive_plot.build(segments, threshold, series_lines,
+                                    q_segments or getattr(app, "current_q_segments", None),
+                                    a_segments or getattr(app, "current_a_segments", None))
     else:
-        # стерео (5:6)
-        # Вопросы на канале 1
-        if q_segments:
-            for start, end in q_segments:
-                axs[0].axvspan(start, end, facecolor='green', alpha=0.25)
-        # Ответы на канале 2
-        if a_segments:
-            for start, end in a_segments:
-                axs[1].axvspan(start, end, facecolor='orange', alpha=0.25)
-
-    # --- Порог ---
-    if threshold is not None:
-        axs[0].axhline(threshold, color='purple', linestyle='--', label='Порог')
-
-    # --- Маркеры и штриховка (на всех видимых каналах) ---
-    if getattr(app, "display_markers", None):
-        for ch in range(n_ch):
-            ax = axs[ch]
-            for x, label in app.display_markers:
-                ax.axvline(x, color='yellow', linestyle='-', linewidth=0.8)
-                # мягкая штриховка +/-3.5 сек
-                ax.axvspan(x - 3.5, x + 3.5, facecolor='grey', alpha=0.08, hatch='////')
-                ax.text(
-                    x, 0.95, label,
-                    transform=ax.get_xaxis_transform(),
-                    rotation=90, va='top', ha='center',
-                    fontsize=8, color='darkorange'
-                )
-
-    # --- Разделители серий ---
-    if series_lines:
-        for x in series_lines:
-            axs[0].axvline(x, color='purple', linestyle='-.', linewidth=1.5)
-
-    axs[-1].set_xlabel("Время (сек)")
-    axs[0].set_title("Сигнал: оригинал vs обработанный")
-    axs[0].legend(loc='upper right')
-
-    plt.tight_layout()
-
-    # Встраиваем в Tk
-    canvas = FigureCanvasTkAgg(fig, master=app.canvas_frame)
-    canvas.draw()
-    canvas.get_tk_widget().pack(fill="both", expand=True)
+        ip = app._interactive_plot
+        if ip.needs_rebuild(sr, n_samples, is_stereo) or force_rebuild:
+            app._interactive_plot = _InteractiveWaveform(app)
+            app._interactive_plot.build(segments, threshold, series_lines,
+                                        q_segments or getattr(app, "current_q_segments", None),
+                                        a_segments or getattr(app, "current_a_segments", None))
+        else:
+            app._interactive_plot.update_playhead(playhead_time)
 
 
 # ------------------------------
-# Графики по сериям (также с прореживанием)
+# Графики по сериям (отдельные окна)
 # ------------------------------
-def plot_series_segments(app, max_points_per_channel: int = 400_000):
+def plot_series_segments(app, max_points_per_channel: int = 400_000, playhead_time=None):
     """
     Окна по сериям (6 меток на серию). В стерео-режиме отображаются оба канала.
+    Если задан playhead_time (или у app есть app.playhead_time) — рисуем вертикальную линию.
     """
     if not getattr(app, "markers", None) or app.audio_data is None:
         return
+
+    if playhead_time is None:
+        playhead_time = getattr(app, "playhead_time", None)
 
     y = _ensure_2d_channels_first(app.audio_data)
     y_orig = _ensure_2d_channels_first(app.original_audio_data)
@@ -370,6 +486,13 @@ def plot_series_segments(app, max_points_per_channel: int = 400_000):
             for start, end in app.current_a_segments:
                 if start >= start_time and end <= end_time:
                     axs[1].axvspan(start, end, facecolor='orange', alpha=0.25)
+
+        # плейхед
+        if playhead_time is not None:
+            for ax in axs:
+                if start_time <= playhead_time <= end_time:
+                    ymin, ymax = ax.get_ylim()
+                    ax.plot([playhead_time, playhead_time], [ymin, ymax], color='red', linewidth=2, alpha=0.9)
 
         axs[0].legend(loc="upper right")
         axs[-1].set_xlabel("Время (сек)")
