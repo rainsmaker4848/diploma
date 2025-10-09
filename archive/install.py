@@ -24,7 +24,8 @@ def install_packages():
         "soundfile",
         "torch",
         "ffmpeg",
-        "noisereduce"
+        "noisereduce",
+        "WhisperX"
     ]
 
     for package in required_packages:
